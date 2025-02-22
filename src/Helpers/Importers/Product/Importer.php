@@ -2,15 +2,19 @@
 
 namespace Webkul\RestApi\Helpers\Importers\Product;
 
-use Illuminate\Support\Arr;
-use Illuminate\Support\Str;
 use Illuminate\Http\UploadedFile;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Http;
-use Intervention\Image\ImageManager;
-use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Intervention\Image\ImageManager;
 use Webkul\DataTransfer\Helpers\Importers\Product\Importer as BaseImporter;
+use Webkul\Product\Jobs\ElasticSearch\UpdateCreateIndex as UpdateCreateElasticSearchIndexJob;
+use Webkul\Product\Jobs\UpdateCreateInventoryIndex as UpdateCreateInventoryIndexJob;
+use Webkul\Product\Jobs\UpdateCreatePriceIndex as UpdateCreatePriceIndexJob;
 
 class Importer extends BaseImporter
 {
@@ -98,7 +102,7 @@ class Importer extends BaseImporter
         }
 
         $this->saveProducts($products);
-        
+
         $this->saveChannels($channels);
 
         $this->saveCustomerGroupPrices($customerGroupPrices);
@@ -120,7 +124,7 @@ class Importer extends BaseImporter
         return true;
     }
 
-        /**
+    /**
      * Prepare images from current batch
      */
     public function prepareImages(array $rowData, array &$imagesData): void
@@ -143,17 +147,31 @@ class Importer extends BaseImporter
         $imagesData[$rowData['sku']] = [];
 
         $imageNames = array_map('trim', explode(',', $rowData['images']));
+        $disks = Config::get('filesystems.disks');
 
         foreach ($imageNames as $key => $image) {
             if (filter_var($image, FILTER_VALIDATE_URL)) {
-                $imagePath = 'product'.DIRECTORY_SEPARATOR.$rowData['sku'];
+                if (array_key_exists('s3', $disks) && $disks['s3']['key'] !== null) {
+                    $parsedUrl = parse_url($image, PHP_URL_PATH);
+                    $parsedUrl = ltrim($parsedUrl, '/');
 
-                if ($uploadedPath = $this->saveImageFromUrl($image, $imagePath)) {
-                    $imagesData[$rowData['sku']][] = [
-                        'name' => $uploadedPath,
-                        'path' => Storage::path($uploadedPath),
-                    ];
-                    continue;
+                    if (Storage::disk('s3')->has($parsedUrl)) {
+                        $imagesData[$rowData['sku']][] = [
+                            'name' => $parsedUrl,
+                            'path' => Storage::disk('s3')->path($parsedUrl),
+                        ];
+
+                        continue;
+                    }
+		        } else {
+                    $imagePath = 'product'.DIRECTORY_SEPARATOR.$rowData['sku'];
+                    if ($uploadedPath = $this->saveImageFromUrl($image, $imagePath)) {
+                        $imagesData[$rowData['sku']][] = [
+                            'name' => $uploadedPath,
+                            'path' => Storage::path($uploadedPath),
+                        ];
+                        continue;
+                    }
                 }
             }
             if (! Storage::has($image)) {
@@ -175,13 +193,23 @@ class Importer extends BaseImporter
         if (empty($imagesData)) {
             return;
         }
-
+        $disks = Config::get('filesystems.disks');
         $productImages = [];
         foreach ($imagesData as $sku => $images) {
             $product = $this->skuStorage->get($sku);
 
             foreach ($images as $key => $image) {
-                if (Storage::has($image['name'])) {
+
+                if (array_key_exists('s3', $disks) && $disks['s3']['key'] !== null) {
+                    if (Storage::disk('s3')->has($image['name'])) {
+                        $productImages[] = [
+                            'type'       => 'images',
+                            'path'       => $image['name'],
+                            'product_id' => $product['id'],
+                            'position'   => $key + 1,
+                        ];
+                    }
+		        } else if (Storage::has($image['name'])) {
                     $productImages[] = [
                         'type'       => 'images',
                         'path'       => $image['name'],
@@ -190,20 +218,20 @@ class Importer extends BaseImporter
                     ];
                 } else {
                     $file = new UploadedFile($image['path'], $image['name']);
-    
+
                     $image = (new ImageManager)->make($file)->encode('webp');
-    
+
                     $imageDirectory = $this->productImageRepository->getProductDirectory((object) $product);
-    
+
                     $path = $imageDirectory.'/'.Str::random(40).'.webp';
-    
+
                     $productImages[] = [
                         'type'       => 'images',
                         'path'       => $path,
                         'product_id' => $product['id'],
                         'position'   => $key + 1,
                     ];
-    
+
                     Storage::put($path, $image);
                 }
             }
@@ -218,6 +246,7 @@ class Importer extends BaseImporter
 
         if (! $response->successful()) {
             Log::error("Failed to fetch the image from URL: $url");
+
             return null;
         }
 
@@ -225,28 +254,65 @@ class Importer extends BaseImporter
         try {
             file_put_contents($tempFilePath, $response->body());
         } catch (\Exception $e) {
-            Log::error("Unable to write temporary file for image URL: $url. Error: " . $e->getMessage());
+            Log::error("Unable to write temporary file for image URL: $url. Error: ".$e->getMessage());
 
             return null;
         }
-    
+
         $image = (new ImageManager)->make(file_get_contents($tempFilePath))->encode('webp');
 
         $path = $path.'/'.Str::random(40).'.webp';
 
         try {
             if (Storage::put($path, $image)) {
-                return  $path;
-            } 
+                return $path;
+            }
 
             Log::error("Failed to store image from URL: $url to path: $path. Error: ");
 
             return null;
         } catch (\Exception $e) {
-            Log::error("Failed to store image from URL: $url to path: $path. Error: " . $e->getMessage());
+            Log::error("Failed to store image from URL: $url to path: $path. Error: ".$e->getMessage());
 
             return null;
         }
+    }
+
+    /**
+     * Prepare categories from current batch
+     */
+    public function prepareCategories(array $rowData, array &$categories): void
+    {
+        if (empty($rowData['categories'])) {
+            return;
+        }
+
+        /**
+         * Reset the sku categories data to prevent
+         * data duplication in case of multiple locales
+         */
+        $categories[$rowData['sku']] = [];
+
+        $rowCategoriesIds = explode('/', $rowData['categories'] ?? '');
+
+        $categoryIds = [];
+
+        foreach ($rowCategoriesIds as $rowCategoryId) {
+            if (isset($this->categories[$rowCategoryId])) {
+                $categoryIds = array_merge($categoryIds, $this->categories[$rowCategoryId]);
+
+                continue;
+            }
+
+            $this->categories[$rowCategoryId] = $this->categoryRepository
+                ->where('id', $rowCategoryId)
+                ->pluck('id')
+                ->toArray();
+
+            $categoryIds = array_merge($categoryIds, $this->categories[$rowCategoryId]);
+        }
+
+        $categories[$rowData['sku']] = $categoryIds;
     }
 
     /**
@@ -278,5 +344,158 @@ class Importer extends BaseImporter
                 'qty'    => $qty,
             ];
         }
+    }
+
+    /**
+     * Start the products indexing process
+     */
+    public function indexBatch($data): bool
+    {
+        /**
+         * Load SKU storage with batch skus
+         */
+        $this->skuStorage->load(Arr::pluck($data, 'sku'));
+
+        $typeProductIds = [];
+
+        foreach ($data as $rowData) {
+            $product = $this->skuStorage->get($rowData['sku']);
+
+            $typeProductIds[$product['type']][] = (int) $product['id'];
+        }
+
+        $productIdsToIndex = [];
+
+        foreach ($typeProductIds as $type => $productIds) {
+            switch ($type) {
+                case self::PRODUCT_TYPE_SIMPLE:
+                case self::PRODUCT_TYPE_VIRTUAL:
+                    $productIdsToIndex = [
+                        ...$productIds,
+                        ...$productIdsToIndex,
+                    ];
+
+                    /**
+                     * Get all the parent bundle product ids
+                     */
+                    $parentBundleProductIds = $this->productBundleOptionRepository
+                        ->select('product_bundle_options.product_id')
+                        ->leftJoin('product_bundle_option_products', 'product_bundle_options.id', 'product_bundle_option_products.product_bundle_option_id')
+                        ->whereIn('product_bundle_option_products.product_id', $productIds)
+                        ->pluck('product_id')
+                        ->toArray();
+
+                    $productIdsToIndex = [
+                        ...$productIdsToIndex,
+                        ...$parentBundleProductIds,
+                    ];
+
+                    /**
+                     * Get all the parent grouped product ids
+                     */
+                    $parentGroupedProductIds = $this->productGroupedProductRepository
+                        ->select('product_id')
+                        ->whereIn('associated_product_id', $productIds)
+                        ->pluck('product_id')
+                        ->toArray();
+
+                    $productIdsToIndex = [
+                        ...$productIdsToIndex,
+                        ...$parentGroupedProductIds,
+                    ];
+
+                    /**
+                     * Get all the parent configurable product ids
+                     */
+                    $parentConfigurableProductIds = $this->productRepository->select('parent_id')
+                        ->whereIn('id', $productIds)
+                        ->whereNotNull('parent_id')
+                        ->pluck('parent_id')
+                        ->toArray();
+
+                    $productIdsToIndex = [
+                        ...$productIdsToIndex,
+                        ...$parentConfigurableProductIds,
+                    ];
+
+                    break;
+
+                case self::PRODUCT_TYPE_CONFIGURABLE:
+                    $productIdsToIndex = [
+                        ...$productIdsToIndex,
+                        ...$productIds,
+                    ];
+
+                    /**
+                     * Get all configurable product children ids
+                     */
+                    $associatedProductIds = $this->productRepository->select('id')
+                        ->whereIn('parent_id', $productIds)
+                        ->pluck('id')
+                        ->toArray();
+
+                    $productIdsToIndex = [
+                        ...$associatedProductIds,
+                        ...$productIdsToIndex,
+                    ];
+
+                    break;
+
+                case self::PRODUCT_TYPE_BUNDLE:
+                    $productIdsToIndex = [
+                        ...$productIdsToIndex,
+                        ...$productIds,
+                    ];
+
+                    /**
+                     * Get all bundle product associated product ids
+                     */
+                    $associatedProductIds = $this->productBundleOptionProductRepository
+                        ->select('product_bundle_option_products.product_id')
+                        ->leftJoin('product_bundle_options', 'product_bundle_option_products.product_bundle_option_id', 'product_bundle_options.id')
+                        ->whereIn('product_bundle_options.product_id', $productIds)
+                        ->pluck('product_id')
+                        ->toArray();
+
+                    $productIdsToIndex = [
+                        ...$associatedProductIds,
+                        ...$productIdsToIndex,
+                    ];
+
+                    break;
+
+                case self::PRODUCT_TYPE_GROUPED:
+                    $productIdsToIndex = [
+                        ...$productIdsToIndex,
+                        ...$productIds,
+                    ];
+
+                    /**
+                     * Get all grouped product associated product ids
+                     */
+                    $associatedProductIds = $this->productGroupedProductRepository
+                        ->select('associated_product_id')
+                        ->whereIn('product_id', $productIds)
+                        ->pluck('associated_product_id')
+                        ->toArray();
+
+                    $productIdsToIndex = [
+                        ...$associatedProductIds,
+                        ...$productIdsToIndex,
+                    ];
+
+                    break;
+            }
+        }
+
+        $productIdsToIndex = array_unique($productIdsToIndex);
+
+        Bus::chain([
+            new UpdateCreateInventoryIndexJob($productIdsToIndex),
+            new UpdateCreatePriceIndexJob($productIdsToIndex),
+            new UpdateCreateElasticSearchIndexJob($productIdsToIndex),
+        ])->onConnection('sync')->dispatch();
+
+        return true;
     }
 }
