@@ -1,10 +1,10 @@
 <?php
 
-namespace Webkul\RestApi\Http\Resources\V1\Admin\Marketing\Communications;
+namespace Webkul\RestApi\Http\Resources\V1\Admin\Catalog;
 
 use Illuminate\Http\Resources\Json\JsonResource;
 
-class SubscriptionResource extends JsonResource
+class AttributePayloadResource extends JsonResource
 {
     /**
      * Transform the resource into an array.
@@ -15,9 +15,9 @@ class SubscriptionResource extends JsonResource
     public function toArray($request)
     {
         return [
-            'id'             => $this->id,
-            'email'          => $this->email,
-            'is_subscribed'  => $this->is_subscribed,
+            'id'       => $this->id,
+            'code'     => $this->code,
+            'position' => $this->position,
         ];
     }
 }
